@@ -10,15 +10,21 @@ import {MAX_SAFE_VOLUME, MAX_TICK} from "@mgv/lib/core/Constants.sol";
 import {AbstractKandelSeeder} from
     "@mgv-strats/src/strategies/offer_maker/market_making/kandel/abstract/AbstractKandelSeeder.sol";
 import {GeometricKandel} from "@mgv-strats/src/strategies/offer_maker/market_making/kandel/abstract/GeometricKandel.sol";
+import {DirectWithBidsAndAsksDistribution} from
+    "@mgv-strats/src/strategies/offer_maker/market_making/kandel/abstract/DirectWithBidsAndAsksDistribution.sol";
+import {CoreKandel} from "@mgv-strats/src/strategies/offer_maker/market_making/kandel/abstract/CoreKandel.sol";
+import {
+    OfferType, KandelLib
+} from "@mgv-strats/src/strategies/offer_maker/market_making/kandel/abstract/KandelLib.sol";
 
 // OpenZeppelin
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {SignedMath} from "@openzeppelin/contracts/utils/math/SignedMath.sol";
 
 // Solady
+import {FixedPointMathLib} from "@solady/src/utils/FixedPointMathLib.sol";
 import {SafeTransferLib} from "@solady/src/utils/SafeTransferLib.sol";
 import {ReentrancyGuard} from "@solady/src/utils/ReentrancyGuard.sol";
 import {Ownable} from "@solady/src/auth/Ownable.sol";
@@ -38,7 +44,7 @@ import {FundsState, KandelPosition} from "@mangrove-vault/src/MangroveVault.sol"
 
 /**
  * @notice Oracle configuration struct packed into a single storage slot
- * @dev Total size: 216 bits (27 bytes)
+ * @dev Total size: 320 bits (32 bytes)
  * @param isStatic Whether oracle is in static mode (8 bits)
  * @param maxTickDeviation Maximum allowed tick deviation (24 bits)
  * @param timelock Timelock duration for oracle changes (24 bits)
@@ -76,7 +82,7 @@ contract MangroveVaultV2 is Ownable, ERC20, Pausable, ReentrancyGuard {
     using Address for address;
     using SafeCastLib for uint256;
     using SafeCastLib for int256;
-    using SignedMath for int256;
+    using FixedPointMathLib for int256;
     using Math for uint256;
     using GeometricKandelExtra for GeometricKandel;
     using MangroveLib for IMangrove;
@@ -139,6 +145,8 @@ contract MangroveVaultV2 is Ownable, ERC20, Pausable, ReentrancyGuard {
         // Next storage slot
         bool isInKandel; // Additional field for funds state
         int24 tickIndex0; // Additional field for tick index
+        int24 bestBid;
+        int24 bestAsk;
     }
 
     /// @notice The current state of the vault.
@@ -186,7 +194,7 @@ contract MangroveVaultV2 is Ownable, ERC20, Pausable, ReentrancyGuard {
         uint256 _maxBase,
         uint256 _maxQuote,
         Oracle memory _oracle
-    ){
+    ) {
         _initializeOwner(_owner);
         seeder = _seeder;
         TICK_SPACING = _tickSpacing;
@@ -205,6 +213,8 @@ contract MangroveVaultV2 is Ownable, ERC20, Pausable, ReentrancyGuard {
 
         _state.feeRecipient = _owner;
         _state.lastFeeAccrualTime = uint64(block.timestamp);
+        _state.bestAsk = type(int24).max;
+        _state.bestBid = type(int24).max;
         emit MangroveVaultEvents.SetFeeData(0, 0, _owner);
 
         manager = _owner;
@@ -266,7 +276,7 @@ contract MangroveVaultV2 is Ownable, ERC20, Pausable, ReentrancyGuard {
         Tick currentTick = getCurrentTick();
         int24 deviation = int24(Tick.unwrap(proposedTick) - Tick.unwrap(currentTick));
 
-        if (uint24(SignedMath.abs(deviation)) > _oracle.maxTickDeviation) {
+        if (uint24(FixedPointMathLib.abs(deviation)) > _oracle.maxTickDeviation) {
             revert MangroveVaultV2Errors.TickDeviationExceeded();
         }
     }
@@ -717,6 +727,66 @@ contract MangroveVaultV2 is Ownable, ERC20, Pausable, ReentrancyGuard {
         uint256 from,
         uint256 to,
         Tick baseQuoteTickIndex0,
+        uint256 firstAskIndex,
+        uint256 _baseQuoteTickOffset,
+        uint256 bidGives,
+        uint256 askGives,
+        Params calldata parameters
+    ) public payable onlyManager {
+        // Accrue fees before major operations
+        _accrueManagementFees();
+
+        GeometricKandel.Params memory kandelParams;
+
+        assembly {
+            kandelParams := parameters
+        }
+
+        // Get the distribution and best bid/ask ticks
+        // Create the parameters struct for _createGeometricDistribution
+        CreateGeometricDistributionParams memory distParams = CreateGeometricDistributionParams({
+            from: from,
+            to: to,
+            baseQuoteTickIndex0: baseQuoteTickIndex0,
+            baseQuoteTickOffset: _baseQuoteTickOffset,
+            firstAskIndex: firstAskIndex,
+            bidGives: bidGives,
+            askGives: askGives,
+            stepSize: kandelParams.stepSize,
+            pricePoints: kandelParams.pricePoints
+        });
+
+        // Get the distribution and best bid/ask ticks
+        (DirectWithBidsAndAsksDistribution.Distribution memory distribution, int256 newBestBid, int256 newBestAsk) =
+            _createGeometricDistribution(distParams);
+
+        // Populate Kandel with the distribution
+        kandel.populate{value: msg.value}(distribution, kandelParams, bidGives, askGives);
+
+        // Update state with tick index
+        _state.tickIndex0 = Tick.unwrap(baseQuoteTickIndex0).toInt24();
+        kandel.setBaseQuoteTickOffset(_baseQuoteTickOffset);
+
+        // Update best bid if the new one is better (higher tick = better bid)
+        if (newBestBid > _state.bestBid) {
+            _state.bestBid = int24(newBestBid);
+        }
+
+        // Update best ask if the new one is better (lower tick = better ask)
+        if (newBestAsk < _state.bestAsk) {
+            _state.bestAsk = int24(newBestAsk);
+        }
+
+        _checkPosition();
+    }
+
+    /**
+     * @notice Populates a chunk of Kandel offers
+     */
+    function populateChunkFromOffset(
+        uint256 from,
+        uint256 to,
+        Tick baseQuoteTickIndex0,
         uint256 _baseQuoteTickOffset,
         uint256 firstAskIndex,
         uint256 bidGives,
@@ -732,71 +802,54 @@ contract MangroveVaultV2 is Ownable, ERC20, Pausable, ReentrancyGuard {
             kandelParams := parameters
         }
 
-        kandel.populateFromOffset{value: msg.value}(
-            from, to, baseQuoteTickIndex0, _baseQuoteTickOffset, firstAskIndex, bidGives, askGives, kandelParams, 0, 0
-        );
+        // Create the parameters struct for _createGeometricDistribution
+        CreateGeometricDistributionParams memory distParams = CreateGeometricDistributionParams({
+            from: from,
+            to: to,
+            baseQuoteTickIndex0: baseQuoteTickIndex0,
+            baseQuoteTickOffset: _baseQuoteTickOffset,
+            firstAskIndex: firstAskIndex,
+            bidGives: bidGives,
+            askGives: askGives,
+            stepSize: kandelParams.stepSize,
+            pricePoints: kandelParams.pricePoints
+        });
 
-        _state.tickIndex0 = Tick.unwrap(baseQuoteTickIndex0).toInt24();
-        kandel.setBaseQuoteTickOffset(_baseQuoteTickOffset);
+        // Get the distribution and best bid/ask ticks
+        (DirectWithBidsAndAsksDistribution.Distribution memory distribution, int256 newBestBid, int256 newBestAsk) =
+            _createGeometricDistribution(distParams);
 
+        kandel.populateChunk(distribution);
         _checkPosition();
     }
-
-    /**
-     * @notice Populates a chunk of Kandel offers
-     */
-    function populateChunkFromOffset(
-        uint256 from,
-        uint256 to,
-        Tick baseQuoteTickIndex0,
-        uint256 firstAskIndex,
-        uint256 bidGives,
-        uint256 askGives
-    ) public payable onlyManager {
-        // Accrue fees before major operations
-        _accrueManagementFees();
-
-        kandel.populateChunkFromOffset{value: msg.value}(
-            from, to, baseQuoteTickIndex0, firstAskIndex, bidGives, askGives
-        );
-        _checkPosition();
-    }
-
-    // TODO: pick best tick from KANDEL instead of MANGROVE
 
     /**
      * @notice Gets the best ask tick from the market
      */
-    function _bestAskTick() internal view returns (int24) {
-        OLKey memory olKey = OLKey(BASE, QUOTE, TICK_SPACING);
-        uint256 bestOfferId = MGV.best(olKey);
-        Tick offerTick = MGV.offers(olKey, bestOfferId).tick();
-        return Tick.unwrap(offerTick);
+    function _bestAskTick() internal view returns (int256) {
+        return _state.bestAsk;
     }
 
     /**
      * @notice Gets the best bid tick from the market
      */
-    function _bestBidTick() internal view returns (int24) {
-        OLKey memory olKey = OLKey(QUOTE, BASE, TICK_SPACING);
-        uint256 offerId = MGV.best(olKey);
-        Tick offerTick = MGV.offers(olKey, offerId).tick();
-        return Tick.unwrap(offerTick);
+    function _bestBidTick() internal view returns (int256) {
+        return _state.bestBid;
     }
 
     /**
      * @notice Validates a tick against oracle configuration
      */
-    function _checkTick(int24 tick, Oracle memory _oracle) internal view {
+    function _checkTick(int256 tick, Oracle memory _oracle) internal view {
         // In static mode, no validation needed as manager controls the static value
         if (_oracle.isStatic) return;
 
         if (_oracle.oracle != address(0)) {
             Tick oracleTick = IOracle(_oracle.oracle).tick();
-            int24 deviation = tick - Tick.unwrap(oracleTick);
+            int256 deviation = tick - Tick.unwrap(oracleTick);
 
             // Check if deviation exceeds allowed bounds (using timelock as max deviation for simplicity)
-            if (uint24(SignedMath.abs(deviation)) > _oracle.timelock) {
+            if (uint24(FixedPointMathLib.abs(deviation)) > _oracle.timelock) {
                 revert MangroveVaultV2Errors.TickDeviationExceeded();
             }
         }
@@ -807,8 +860,8 @@ contract MangroveVaultV2 is Ownable, ERC20, Pausable, ReentrancyGuard {
      */
     function _checkPosition() internal {
         Oracle memory _oracle = oracle;
-        int24 bestAskTick = _bestAskTick();
-        int24 bestBidTick = _bestBidTick();
+        int256 bestAskTick = _bestAskTick();
+        int256 bestBidTick = _bestBidTick();
 
         _checkTick(bestAskTick, _oracle);
         _checkTick(-bestBidTick, _oracle);
@@ -1000,5 +1053,183 @@ contract MangroveVaultV2 is Ownable, ERC20, Pausable, ReentrancyGuard {
             QUOTE.safeApproveWithRetry(address(kandel), quoteBalance);
         }
         kandel.depositFunds(baseBalance, quoteBalance);
+    }
+
+    /**
+     * @notice Parameters for creating a geometric distribution
+     * @param from populate offers starting from this index (inclusive). Must be at most `pricePoints`.
+     * @param to populate offers until this index (exclusive). Must be at most `pricePoints`.
+     * @param baseQuoteTickIndex0 the tick for the price point at index 0 given as a tick on the `base, quote` offer list
+     * @param baseQuoteTickOffset the tick offset used for the geometric progression deployment. Must be at least 1.
+     * @param firstAskIndex the (inclusive) index after which offer should be an ask. Must be at most `pricePoints`.
+     * @param bidGives The initial amount of quote to give for all bids
+     * @param askGives The initial amount of base to give for all asks
+     * @param stepSize in amount of price points to jump for posting dual offer. Must be less than `pricePoints`.
+     * @param pricePoints the number of price points for the Kandel instance. Must be at least 2.
+     */
+    struct CreateGeometricDistributionParams {
+        uint256 from;
+        uint256 to;
+        Tick baseQuoteTickIndex0;
+        uint256 baseQuoteTickOffset;
+        uint256 firstAskIndex;
+        uint256 bidGives;
+        uint256 askGives;
+        uint256 stepSize;
+        uint256 pricePoints;
+    }
+
+    ///@dev Modified `KandelLib.createGeometricDistribution` implementation for this context
+    ///@notice Creates a distribution of bids and asks given by the parameters. Dual offers are included with gives=0.
+    ///@notice Returns not only the distribution but the best bid and ask prices
+    ///@param params The parameters for creating the geometric distribution
+    ///@return distribution the distribution of bids and asks to populate
+    ///@return bestBid the tick of the best (highest price) bid
+    ///@return bestAsk the tick of the best (lowest price) ask
+    ///@dev the absolute price of an offer is the ratio of quote/base volumes of tokens it trades
+    ///@dev the tick of offers on Mangrove are in relative taker price of maker's inbound/outbound volumes of tokens it trades
+    ///@dev for Bids, outbound_tkn=quote, inbound_tkn=base so relative taker price of a a bid is the inverse of the absolute price.
+    ///@dev for Asks, outbound_tkn=base, inbound_tkn=quote so relative taker price of an ask coincides with absolute price.
+    ///@dev Index0 will contain the ask with the lowest relative price and the bid with the highest relative price. Absolute price is geometrically increasing over indexes.
+    ///@dev tickOffset moves an offer relative price s.t. `AskTick_{i+1} = AskTick_i + tickOffset` and `BidTick_{i+1} = BidTick_i - tickOffset`
+    ///@dev A hole is left in the middle at the size of stepSize - either an offer or its dual is posted, not both.
+    ///@dev The caller should make sure the minimum and maximum tick does not exceed the MIN_TICK and MAX_TICK from respectively; otherwise, populate will fail for those offers.
+    ///@dev If type(uint).max is used for `bidGives` or `askGives` then very high or low prices can yield gives=0 (which results in both offer an dual being dead) or gives>=type(uin96).max which is not supported by Mangrove.
+    function _createGeometricDistribution(CreateGeometricDistributionParams memory params)
+        private
+        pure
+        returns (DirectWithBidsAndAsksDistribution.Distribution memory distribution, int256 bestBid, int256 bestAsk)
+    {
+        require(
+            params.bidGives != type(uint256).max || params.askGives != type(uint256).max, "Kandel/bothGivesVariable"
+        );
+
+        // Initialize best bid and ask to extreme values
+        bestBid = type(int256).min; // Will be updated to the highest bid tick
+        bestAsk = type(int256).max; // Will be updated to the lowest ask tick
+
+        // First we restrict boundaries of bids and asks.
+
+        // Create live bids up till first ask, except stop where live asks will have a dual bid.
+        uint256 bidBound;
+        {
+            // Rounding - we skip an extra live bid if stepSize is odd.
+            uint256 bidHoleSize = params.stepSize / 2 + params.stepSize % 2;
+            // If first ask is close to start, then there are no room for live bids.
+            bidBound = params.firstAskIndex > bidHoleSize ? params.firstAskIndex - bidHoleSize : 0;
+            // If stepSize is large there is not enough room for dual outside
+            uint256 lastBidWithPossibleDualAsk = params.pricePoints - params.stepSize;
+            if (bidBound > lastBidWithPossibleDualAsk) {
+                bidBound = lastBidWithPossibleDualAsk;
+            }
+        }
+        // Here firstAskIndex becomes the index of the first actual ask, and not just the boundary - we need to take `stepSize` and `from` into account.
+        params.firstAskIndex = params.firstAskIndex + params.stepSize / 2;
+        // We should not place live asks near the beginning, there needs to be room for the dual bid.
+        if (params.firstAskIndex < params.stepSize) {
+            params.firstAskIndex = params.stepSize;
+        }
+
+        // Finally, account for the from/to boundaries
+        if (params.to < bidBound) {
+            bidBound = params.to;
+        }
+        if (params.firstAskIndex < params.from) {
+            params.firstAskIndex = params.from;
+        }
+
+        // Allocate distributions - there should be room for live bids and asks, and their duals.
+        {
+            uint256 count = (params.from < bidBound ? bidBound - params.from : 0)
+                + (params.firstAskIndex < params.to ? params.to - params.firstAskIndex : 0);
+            distribution.bids = new DirectWithBidsAndAsksDistribution.DistributionOffer[](count);
+            distribution.asks = new DirectWithBidsAndAsksDistribution.DistributionOffer[](count);
+        }
+
+        // Start bids at from
+        uint256 index = params.from;
+        // Calculate the taker relative tick of the first price point
+        int256 tick = -(Tick.unwrap(params.baseQuoteTickIndex0) + int256(params.baseQuoteTickOffset) * int256(index));
+        // A counter for insertion in the distribution structs
+        uint256 i = 0;
+        for (; index < bidBound; ++index) {
+            // Add live bid
+            // Use askGives unless it should be derived from bid at the price
+            uint256 bidGivesAmount = params.bidGives == type(uint256).max
+                ? Tick.wrap(tick).outboundFromInbound(params.askGives)
+                : params.bidGives;
+
+            distribution.bids[i] = DirectWithBidsAndAsksDistribution.DistributionOffer({
+                index: index,
+                tick: Tick.wrap(tick),
+                gives: bidGivesAmount
+            });
+
+            // Update best bid if this is a live bid (gives > 0) and tick is higher
+            if (bidGivesAmount > 0 && tick > bestBid) {
+                bestBid = tick;
+            }
+
+            // Add dual (dead) ask
+            uint256 dualIndex =
+                KandelLib.transportDestination(OfferType.Ask, index, params.stepSize, params.pricePoints);
+            distribution.asks[i] = DirectWithBidsAndAsksDistribution.DistributionOffer({
+                index: dualIndex,
+                tick: Tick.wrap(
+                    (Tick.unwrap(params.baseQuoteTickIndex0) + int256(params.baseQuoteTickOffset) * int256(dualIndex))
+                ),
+                gives: 0
+            });
+
+            // Next tick
+            tick -= int256(params.baseQuoteTickOffset);
+            ++i;
+        }
+
+        // Start asks from (adjusted) firstAskIndex
+        index = params.firstAskIndex;
+        // Calculate the taker relative tick of the first ask
+        tick = (Tick.unwrap(params.baseQuoteTickIndex0) + int256(params.baseQuoteTickOffset) * int256(index));
+        for (; index < params.to; ++index) {
+            // Add live ask
+            // Use askGives unless it should be derived from bid at the price
+            uint256 askGivesAmount = params.askGives == type(uint256).max
+                ? Tick.wrap(tick).outboundFromInbound(params.bidGives)
+                : params.askGives;
+
+            distribution.asks[i] = DirectWithBidsAndAsksDistribution.DistributionOffer({
+                index: index,
+                tick: Tick.wrap(tick),
+                gives: askGivesAmount
+            });
+
+            // Update best ask if this is a live ask (gives > 0) and tick is lower
+            if (askGivesAmount > 0 && tick < bestAsk) {
+                bestAsk = tick;
+            }
+
+            // Add dual (dead) bid
+            uint256 dualIndex =
+                KandelLib.transportDestination(OfferType.Bid, index, params.stepSize, params.pricePoints);
+            distribution.bids[i] = DirectWithBidsAndAsksDistribution.DistributionOffer({
+                index: dualIndex,
+                tick: Tick.wrap(
+                    -(Tick.unwrap(params.baseQuoteTickIndex0) + int256(params.baseQuoteTickOffset) * int256(dualIndex))
+                ),
+                gives: 0
+            });
+
+            // Next tick
+            tick += int256(params.baseQuoteTickOffset);
+            ++i;
+        }
+
+        // If no live bids or asks were found, set to sentinel values
+        if (bestBid == type(int256).min) {
+            bestBid = 0; // or another appropriate default
+        }
+        if (bestAsk == type(int256).max) {
+            bestAsk = 0; // or another appropriate default
+        }
     }
 }
